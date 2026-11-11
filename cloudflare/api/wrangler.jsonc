@@ -1,0 +1,32 @@
+{
+  "name": "wasteworx-api-development",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-08",
+  "workers_dev": true,
+  "assets": {
+    "directory": "../../dist-web",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "vars": {
+    "ENVIRONMENT": "development",
+    "CORS_ORIGIN": "http://localhost:8081",
+    "EMAIL_FROM": "WasteWorx <noreply@wasteworx.co.bw>"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "wasteworx-development",
+      "database_id": "f69ef03e-ceba-4fea-add3-9a970710513f",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "JOBS",
+        "queue": "wasteworx-jobs-development"
+      }
+    ]
+  }
+}

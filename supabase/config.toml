@@ -1,0 +1,10 @@
+project_id = "wasteworx"
+
+[functions.register-household]
+verify_jwt = true
+
+[functions.resend-invite]
+verify_jwt = true
+
+[functions.invite-business]
+verify_jwt = true
