@@ -1,30 +1,10 @@
 import { authenticateSupabase } from './supabase-auth';
 import { sendTransactionalEmail } from './email';
 
-type D1Statement = {
-  first<T>(): Promise<T | null>;
-  bind(...values: unknown[]): D1Statement;
-  all<T>(): Promise<{ results: T[] }>;
-  run(): Promise<unknown>;
-};
-
-type D1Database = {
-  batch(statements: D1Statement[]): Promise<unknown>;
-  prepare(query: string): D1Statement;
-};
-
-type Queue = {
-  send(message: unknown): Promise<void>;
-};
-
-type Assets = {
-  fetch(request: Request): Promise<Response>;
-};
-
 export type Env = {
   CORS_ORIGIN: string;
   EMAIL_FROM: string;
-  ASSETS: Assets;
+  ASSETS: Fetcher;
   DB: D1Database;
   ENVIRONMENT: 'development' | 'production';
   JOBS: Queue;

@@ -33,7 +33,7 @@ Copy `.env.example` to `.env.local` and set the Supabase project URL and publish
 ## Checks and deployment
 
 ```bash
-npm run web:typecheck
+npm run typecheck   # website and Worker
 npm run web:build
 npx wrangler deploy --config cloudflare/api/wrangler.jsonc
 ```

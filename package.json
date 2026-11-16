@@ -1,6 +1,9 @@
 {
   "name": "wasteworx",
   "version": "1.0.0",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.3",
     "lucide-react": "^1.70.0",
@@ -9,18 +12,22 @@
     "react-router-dom": "^7.18.5"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261116.1",
     "@electric-sql/pglite": "^0.5.15",
     "@types/node": "^26.6.6",
     "@types/react": "~19.2.2",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.2.1",
     "typescript": "~6.0.3",
-    "vite": "^8.3.6"
+    "vite": "^8.3.6",
+    "wrangler": "^4.163.0"
   },
   "scripts": {
     "start": "vite --host 127.0.0.1",
     "web:dev": "vite --host 127.0.0.1",
-    "api:dev": "npx wrangler dev --config cloudflare/api/wrangler.jsonc",
+    "api:dev": "wrangler dev --config cloudflare/api/wrangler.jsonc",
+    "api:typecheck": "tsc --project cloudflare/api/tsconfig.json",
+    "typecheck": "npm run web:typecheck && npm run api:typecheck",
     "web:build": "vite build",
     "web:typecheck": "tsc --project web/tsconfig.json",
     "web:preview": "vite preview --host 127.0.0.1",
