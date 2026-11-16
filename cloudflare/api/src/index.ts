@@ -43,11 +43,52 @@ const cors = (request: Request, env: Env) => ({
 type Principal = { email: string; id: string; roles: string[] };
 const now = () => new Date().toISOString();
 const newId = () => crypto.randomUUID();
-const value = (body: Record<string, unknown>, key: string, maximum = 2_000) => {
+
+// Matches the legacy Supabase format (WWX- plus 6-20 of A-Z0-9). The 32-character
+// alphabet omits look-alike characters and maps from a random byte without bias.
+const codeAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const newHouseholdCode = () => `WWX-${Array.from(crypto.getRandomValues(new Uint8Array(8)), (byte) => codeAlphabet[byte % 32]).join('')}`;
+
+/** A problem with the caller's input. Its message is safe to show to the caller. */
+class InputError extends Error {}
+
+async function readBody(request: Request) {
+  const body: unknown = await request.json().catch(() => null);
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new InputError('The request body must be a JSON object.');
+  return body as Record<string, unknown>;
+}
+
+/**
+ * Turns a failed write into a response. Input problems and known constraint
+ * violations get a readable message; anything else is logged and hidden.
+ */
+function failure(error: unknown, headers: HeadersInit, conflicts: Record<string, string>) {
+  if (error instanceof InputError) return json({ error: error.message }, { status: 400, headers });
+  const detail = error instanceof Error ? error.message : String(error);
+  const conflict = Object.entries(conflicts).find(([constraint]) => detail.includes(constraint));
+  if (conflict) return json({ error: conflict[1] }, { status: 409, headers });
+  console.error('request_failed', detail);
+  return json({ error: 'internal_error' }, { status: 500, headers });
+}
+
+const businessConflicts = {
+  business_registration_unique: 'A business with this registration number is already registered.',
+  business_name_unique: 'A business with this registered name is already registered.',
+  business_site_address_unique: 'Two sites share the same address. Give each site its own address.',
+  business_site_name_unique: 'Two sites share the same name. Give each site its own name.',
+  'FOREIGN KEY constraint failed': 'These sites already have reviews or members and cannot be replaced.',
+};
+
+const householdConflicts = {
+  addresses_property_reference_unique: 'A household is already registered with this property reference.',
+  'households.household_code': 'The household code could not be assigned. Please try again.',
+};
+
+const value =(body: Record<string, unknown>, key: string, maximum = 2_000) => {
   const input = body[key];
-  if (input !== undefined && typeof input !== 'string') throw new Error(`${key} must be text.`);
+  if (input !== undefined && typeof input !== 'string') throw new InputError(`${key} must be text.`);
   const result = (input ?? '').trim();
-  if (result.length > maximum) throw new Error(`${key} is too long.`);
+  if (result.length > maximum) throw new InputError(`${key} is too long.`);
   return result;
 };
 
@@ -75,7 +116,7 @@ function staff(identity: Principal) {
   return identity.roles.includes('super_admin') || identity.roles.includes('registration_staff');
 }
 
-export default {
+const routes = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const headers = cors(request, env);
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers });
@@ -111,19 +152,22 @@ export default {
       if (identity instanceof Response) return identity;
       if (!staff(identity)) return json({ error: 'staff_access_required' }, { status: 403, headers });
       try {
-        const body = await request.json() as Record<string, unknown>;
+        const body = await readBody(request);
         const requestKey = value(body, 'request_key', 120);
         const submit = body.submit === true;
         const registeredName = value(body, 'registered_name', 240);
         const registrationNumber = value(body, 'registration_number', 120) || null;
         const registrationException = value(body, 'registration_exception', 1_000);
         const contactEmail = value(body, 'contact_email', 320).toLowerCase();
+        const countryCode = (value(body, 'country_code', 2) || 'BW').toUpperCase();
+        if (!/^[A-Z]{2}$/.test(countryCode)) throw new InputError('country_code must be a two-letter country code.');
         const sites = Array.isArray(body.sites) ? body.sites as Record<string, unknown>[] : [];
-        if (!requestKey) throw new Error('request_key is required.');
+        if (sites.some((site) => !site || typeof site !== 'object' || Array.isArray(site))) throw new InputError('Each site must be an object.');
+        if (!requestKey) throw new InputError('request_key is required.');
         if (submit && (!registeredName || !value(body, 'industry', 160) || (!registrationNumber && !registrationException) || !contactEmail || !sites.length)) {
-          throw new Error('Complete the required business registration details.');
+          throw new InputError('Complete the required business registration details.');
         }
-        if (contactEmail && !/^\S+@\S+\.\S+$/.test(contactEmail)) throw new Error('Enter a valid contact email address.');
+        if (contactEmail && !/^\S+@\S+\.\S+$/.test(contactEmail)) throw new InputError('Enter a valid contact email address.');
         const existing = await env.DB.prepare('select id from businesses where created_by = ? and request_key = ?').bind(identity.id, requestKey).first<{ id: string }>();
         const businessId = existing?.id ?? newId(); const timestamp = now();
         const status = submit ? 'submitted' : 'draft';
@@ -131,21 +175,21 @@ export default {
           env.DB.prepare(`insert into businesses (id, request_key, registered_name, trading_name, registration_number, registration_exception, country_code, industry, contact_name, contact_role, contact_email, contact_phone, service_needs, verification_status, created_by, created_at, updated_at)
             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(created_by, request_key) do update set registered_name=excluded.registered_name, trading_name=excluded.trading_name, registration_number=excluded.registration_number, registration_exception=excluded.registration_exception, country_code=excluded.country_code, industry=excluded.industry, contact_name=excluded.contact_name, contact_role=excluded.contact_role, contact_email=excluded.contact_email, contact_phone=excluded.contact_phone, service_needs=excluded.service_needs, verification_status=excluded.verification_status, version=businesses.version+1, updated_at=excluded.updated_at`)
-            .bind(businessId, requestKey, registeredName, value(body, 'trading_name', 240), registrationNumber, registrationException, value(body, 'country_code', 2) || 'BW', value(body, 'industry', 160), value(body, 'contact_name', 160), value(body, 'contact_role', 160), contactEmail, value(body, 'contact_phone', 40), value(body, 'service_needs', 2_000), status, identity.id, timestamp, timestamp),
+            .bind(businessId, requestKey, registeredName, value(body, 'trading_name', 240), registrationNumber, registrationException, countryCode, value(body, 'industry', 160), value(body, 'contact_name', 160), value(body, 'contact_role', 160), contactEmail, value(body, 'contact_phone', 40), value(body, 'service_needs', 2_000), status, identity.id, timestamp, timestamp),
           env.DB.prepare('insert into business_evidence (id, business_id, reference, notes) values (?, ?, ?, ?) on conflict(business_id) do update set reference=excluded.reference, notes=excluded.notes')
             .bind(newId(), businessId, value(body, 'evidence_reference', 500), value(body, 'evidence_notes', 2_000)),
         ];
         if (existing) statements.push(env.DB.prepare('delete from business_sites where business_id = ?').bind(businessId));
         for (const site of sites) {
           const name = value(site, 'name', 160); const address = value(site, 'address', 400); const city = value(site, 'city', 160);
-          if (submit && (!name || !address || !city)) throw new Error('Complete each collection site.');
+          if (submit && (!name || !address || !city)) throw new InputError('Complete each collection site.');
           statements.push(env.DB.prepare('insert into business_sites (id, business_id, name, address, city) values (?, ?, ?, ?, ?)').bind(newId(), businessId, name, address, city));
         }
         statements.push(env.DB.prepare('insert into audit_logs (table_name, record_id, action, actor_user_id, new_values, occurred_at) values (?, ?, ?, ?, ?, ?)').bind('businesses', businessId, existing ? 'update' : 'insert', identity.id, JSON.stringify({ verification_status: status }), timestamp));
         await env.DB.batch(statements);
         return json({ id: businessId, verification_status: status }, { status: existing ? 200 : 201, headers });
       } catch (error) {
-        return json({ error: error instanceof Error ? error.message : 'registration_failed' }, { status: 400, headers });
+        return failure(error, headers, businessConflicts);
       }
     }
 
@@ -162,28 +206,40 @@ export default {
       if (identity instanceof Response) return identity;
       if (!staff(identity)) return json({ error: 'staff_access_required' }, { status: 403, headers });
       try {
-        const body = await request.json() as Record<string, unknown>;
+        const body = await readBody(request);
         const name = value(body, 'household_name', 160); const contactName = value(body, 'primary_contact_name', 160); const email = value(body, 'primary_contact_email', 320).toLowerCase();
         const addressLine = value(body, 'address_line_1', 200); const suburb = value(body, 'suburb', 120); const city = value(body, 'city', 120);
-        if (!name || !contactName || !email || !addressLine || !suburb || !city || body.consent_confirmed !== true) throw new Error('Complete all required fields and confirm consent.');
-        if (!/^\S+@\S+\.\S+$/.test(email)) throw new Error('Enter a valid primary-contact email address.');
+        if (!name || !contactName || !email || !addressLine || !suburb || !city || body.consent_confirmed !== true) throw new InputError('Complete all required fields and confirm consent.');
+        if (!/^\S+@\S+\.\S+$/.test(email)) throw new InputError('Enter a valid primary-contact email address.');
         const timestamp = now(); const addressId = newId(); const householdId = newId(); const membershipId = newId();
-        const count = await env.DB.prepare('select count(*) as count from households').first<{ count: number }>();
-        const code = `WW-${String((count?.count ?? 0) + 1).padStart(5, '0')}`;
+        const code = newHouseholdCode();
         await env.DB.batch([
           env.DB.prepare('insert into addresses (id, property_reference, address_line_1, address_line_2, suburb, city, district, access_notes, verification_status, verification_method, created_by, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(addressId, value(body, 'property_reference', 120) || null, addressLine, value(body, 'address_line_2', 200), suburb, city, value(body, 'district', 120), value(body, 'access_notes', 1_000), 'verified', value(body, 'verification_method', 40) || 'event_in_person', identity.id, timestamp, timestamp),
           env.DB.prepare('insert into households (id, household_code, name, address_id, status, operational_notes, consent_version, consented_at, registered_by, registered_at, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(householdId, code, name, addressId, 'verified', value(body, 'operational_notes', 1_000), 'pilot-v1', timestamp, identity.id, timestamp, timestamp, timestamp),
           env.DB.prepare('insert into household_memberships (id, household_id, full_name, email, phone, member_type, status, created_by, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(membershipId, householdId, contactName, email, value(body, 'primary_contact_phone', 40), 'primary_contact', 'pending', identity.id, timestamp, timestamp),
           env.DB.prepare('insert into audit_logs (table_name, record_id, action, actor_user_id, new_values, occurred_at) values (?, ?, ?, ?, ?, ?)').bind('households', householdId, 'insert', identity.id, JSON.stringify({ household_code: code }), timestamp),
         ]);
-        const invitation = await sendTransactionalEmail(env, { to: email, subject: 'Your WasteWorx household is ready', text: `Your household ${code} has been registered. Create or sign in to your WasteWorx account to continue.`, html: `<h1>Welcome to WasteWorx</h1><p>Your household ${code} has been registered. Create or sign in to your WasteWorx account to continue.</p>` });
+        // The household is already saved, so a failed email must not fail the request and invite a duplicate registration.
+        const invitation = await sendTransactionalEmail(env, { to: email, subject: 'Your WasteWorx household is ready', text: `Your household ${code} has been registered. Create or sign in to your WasteWorx account to continue.`, html: `<h1>Welcome to WasteWorx</h1><p>Your household ${code} has been registered. Create or sign in to your WasteWorx account to continue.</p>` })
+          .catch(() => ({ ok: false as const }));
         return json({ created_household_id: householdId, created_household_code: code, invitation: invitation.ok ? 'sent' : 'pending' }, { status: 201, headers });
       } catch (error) {
-        return json({ error: error instanceof Error ? error.message : 'registration_failed' }, { status: 400, headers });
+        return failure(error, headers, householdConflicts);
       }
     }
 
     if (url.pathname.startsWith('/v1/')) return json({ error: 'not_found' }, { status: 404, headers });
     return secure(await env.ASSETS.fetch(request));
+  },
+};
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      return await routes.fetch(request, env);
+    } catch (error) {
+      console.error('unhandled_error', error instanceof Error ? error.message : String(error));
+      return json({ error: 'internal_error' }, { status: 500, headers: cors(request, env) });
+    }
   },
 };
