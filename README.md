@@ -53,9 +53,16 @@ Copy `.env.example` to `.env.local` and set the Supabase project URL and publish
 ## Checks and deployment
 
 ```bash
-npm run typecheck   # website and Worker
-npm run web:build
+npm test            # typecheck, build, API tests and the browser test
 npx wrangler deploy --config cloudflare/api/wrangler.jsonc
 ```
+
+`npm test` starts its own copy of the app on spare ports: the Worker on a throwaway local database, a stand-in for Supabase Auth, and the website. It does not touch Supabase, your local development database or anything deployed, and it can run while `npm start` and `npm run api:dev` are running.
+
+- `npm run test:api` — Worker API tests only ([tests/api.test.mjs](tests/api.test.mjs)).
+- `npm run test:web` — the business draft flow in headless Chrome ([tests/web.test.mjs](tests/web.test.mjs)). It is skipped if Chrome is not installed; set `CHROME_PATH` to point at another Chromium-based browser.
+- `npm run typecheck` — website and Worker types only.
+
+Both test scripts need `dist-web/` to exist, so run `npm run web:build` once before using them on their own.
 
 The development website and API are served together by the Cloudflare Worker. See [the Cloudflare migration notes](cloudflare/README.md) for D1, Queue and data-import details.
