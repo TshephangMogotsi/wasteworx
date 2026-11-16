@@ -26,6 +26,7 @@
     "start": "vite --host 127.0.0.1",
     "web:dev": "vite --host 127.0.0.1",
     "api:dev": "wrangler dev --config cloudflare/api/wrangler.jsonc",
+    "api:migrate:local": "wrangler d1 migrations apply wasteworx-development --local --config cloudflare/api/wrangler.jsonc",
     "api:typecheck": "tsc --project cloudflare/api/tsconfig.json",
     "typecheck": "npm run web:typecheck && npm run api:typecheck",
     "web:build": "vite build",

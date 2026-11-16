@@ -1,5 +1,6 @@
 export type SupabaseIdentity = {
   email: string | null;
+  emailVerified: boolean;
   id: string;
   name: string | null;
 };
@@ -28,10 +29,11 @@ export async function authenticateSupabase(request: Request, env: AuthBridgeEnvi
   });
   if (!response.ok) return { code: 'unauthorized', ok: false, status: 401 };
 
-  const user = await response.json() as { email?: string; id: string; user_metadata?: { full_name?: string; name?: string } };
+  const user = await response.json() as { email?: string; email_confirmed_at?: string | null; id: string; user_metadata?: { full_name?: string; name?: string } };
   return {
     identity: {
       email: user.email?.toLowerCase() ?? null,
+      emailVerified: Boolean(user.email_confirmed_at),
       id: user.id,
       name: user.user_metadata?.full_name ?? user.user_metadata?.name ?? null,
     },

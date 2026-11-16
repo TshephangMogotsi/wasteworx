@@ -35,7 +35,7 @@ const secure = (response: Response) => {
 
 const cors = (request: Request, env: Env) => ({
   'access-control-allow-headers': 'authorization, content-type',
-  'access-control-allow-methods': 'GET, POST, PATCH, OPTIONS',
+  'access-control-allow-methods': 'GET, POST, PUT, PATCH, OPTIONS',
   'access-control-allow-origin': request.headers.get('origin') === env.CORS_ORIGIN ? env.CORS_ORIGIN : '',
   vary: 'Origin',
 });
@@ -96,6 +96,8 @@ async function principal(request: Request, env: Env): Promise<Principal | Respon
   const authentication = await authenticateSupabase(request, env);
   if (!authentication.ok) return json({ error: authentication.code }, { status: authentication.status, headers: cors(request, env) });
   if (!authentication.identity.email) return json({ error: 'email_unavailable' }, { status: 422, headers: cors(request, env) });
+  // Accounts are linked to invitations by email below, so an unconfirmed address must never be trusted.
+  if (!authentication.identity.emailVerified) return json({ error: 'email_unverified' }, { status: 403, headers: cors(request, env) });
   const existing = await env.DB.prepare('select id, email from app_users where legacy_supabase_user_id = ? or lower(email) = lower(?) limit 1')
     .bind(authentication.identity.id, authentication.identity.email).first<{ email: string; id: string }>();
   const user = existing ?? { id: authentication.identity.id, email: authentication.identity.email };
@@ -115,6 +117,55 @@ async function principal(request: Request, env: Env): Promise<Principal | Respon
 function staff(identity: Principal) {
   return identity.roles.includes('super_admin') || identity.roles.includes('registration_staff');
 }
+
+type BusinessInput = ReturnType<typeof businessInput>;
+
+/** Reads and validates the business fields shared by creating and editing a registration. */
+function businessInput(body: Record<string, unknown>) {
+  const submit = body.submit === true;
+  const input = {
+    contactEmail: value(body, 'contact_email', 320).toLowerCase(),
+    contactName: value(body, 'contact_name', 160),
+    contactPhone: value(body, 'contact_phone', 40),
+    contactRole: value(body, 'contact_role', 160),
+    countryCode: (value(body, 'country_code', 2) || 'BW').toUpperCase(),
+    evidenceNotes: value(body, 'evidence_notes', 2_000),
+    evidenceReference: value(body, 'evidence_reference', 500),
+    industry: value(body, 'industry', 160),
+    registeredName: value(body, 'registered_name', 240),
+    registrationException: value(body, 'registration_exception', 1_000),
+    registrationNumber: value(body, 'registration_number', 120) || null,
+    serviceNeeds: value(body, 'service_needs', 2_000),
+    status: submit ? 'submitted' : 'draft',
+    tradingName: value(body, 'trading_name', 240),
+  };
+  if (!/^[A-Z]{2}$/.test(input.countryCode)) throw new InputError('country_code must be a two-letter country code.');
+  const sites = (Array.isArray(body.sites) ? body.sites as unknown[] : []).map((site) => {
+    if (!site || typeof site !== 'object' || Array.isArray(site)) throw new InputError('Each site must be an object.');
+    const record = site as Record<string, unknown>;
+    const entry = { address: value(record, 'address', 400), city: value(record, 'city', 160), name: value(record, 'name', 160) };
+    if (submit && (!entry.name || !entry.address || !entry.city)) throw new InputError('Complete each collection site.');
+    return entry;
+  });
+  if (submit && (!input.registeredName || !input.industry || (!input.registrationNumber && !input.registrationException) || !input.contactEmail || !sites.length)) {
+    throw new InputError('Complete the required business registration details.');
+  }
+  if (input.contactEmail && !/^\S+@\S+\.\S+$/.test(input.contactEmail)) throw new InputError('Enter a valid contact email address.');
+  return { ...input, sites };
+}
+
+/** Evidence and sites are replaced wholesale on every save. */
+function businessDetailStatements(env: Env, businessId: string, input: BusinessInput) {
+  return [
+    env.DB.prepare('insert into business_evidence (id, business_id, reference, notes) values (?, ?, ?, ?) on conflict(business_id) do update set reference=excluded.reference, notes=excluded.notes')
+      .bind(newId(), businessId, input.evidenceReference, input.evidenceNotes),
+    env.DB.prepare('delete from business_sites where business_id = ?').bind(businessId),
+    ...input.sites.map((site) => env.DB.prepare('insert into business_sites (id, business_id, name, address, city) values (?, ?, ?, ?, ?)').bind(newId(), businessId, site.name, site.address, site.city)),
+  ];
+}
+
+const lockedRegistration = 'This registration has been submitted and can no longer be edited.';
+const staleDraft = 'This draft was changed by someone else. Reload it and try again.';
 
 const routes = {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -154,42 +205,70 @@ const routes = {
       try {
         const body = await readBody(request);
         const requestKey = value(body, 'request_key', 120);
-        const submit = body.submit === true;
-        const registeredName = value(body, 'registered_name', 240);
-        const registrationNumber = value(body, 'registration_number', 120) || null;
-        const registrationException = value(body, 'registration_exception', 1_000);
-        const contactEmail = value(body, 'contact_email', 320).toLowerCase();
-        const countryCode = (value(body, 'country_code', 2) || 'BW').toUpperCase();
-        if (!/^[A-Z]{2}$/.test(countryCode)) throw new InputError('country_code must be a two-letter country code.');
-        const sites = Array.isArray(body.sites) ? body.sites as Record<string, unknown>[] : [];
-        if (sites.some((site) => !site || typeof site !== 'object' || Array.isArray(site))) throw new InputError('Each site must be an object.');
         if (!requestKey) throw new InputError('request_key is required.');
-        if (submit && (!registeredName || !value(body, 'industry', 160) || (!registrationNumber && !registrationException) || !contactEmail || !sites.length)) {
-          throw new InputError('Complete the required business registration details.');
-        }
-        if (contactEmail && !/^\S+@\S+\.\S+$/.test(contactEmail)) throw new InputError('Enter a valid contact email address.');
-        const existing = await env.DB.prepare('select id from businesses where created_by = ? and request_key = ?').bind(identity.id, requestKey).first<{ id: string }>();
+        const input = businessInput(body);
+        const existing = await env.DB.prepare('select id, verification_status from businesses where created_by = ? and request_key = ?')
+          .bind(identity.id, requestKey).first<{ id: string; verification_status: string }>();
+        // A repeat of a request whose registration has already left draft is a replay; it must not reopen or rewrite it.
+        if (existing && existing.verification_status !== 'draft') return json({ id: existing.id, verification_status: existing.verification_status }, { headers });
         const businessId = existing?.id ?? newId(); const timestamp = now();
-        const status = submit ? 'submitted' : 'draft';
-        const statements = [
+        await env.DB.batch([
           env.DB.prepare(`insert into businesses (id, request_key, registered_name, trading_name, registration_number, registration_exception, country_code, industry, contact_name, contact_role, contact_email, contact_phone, service_needs, verification_status, created_by, created_at, updated_at)
             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            on conflict(created_by, request_key) do update set registered_name=excluded.registered_name, trading_name=excluded.trading_name, registration_number=excluded.registration_number, registration_exception=excluded.registration_exception, country_code=excluded.country_code, industry=excluded.industry, contact_name=excluded.contact_name, contact_role=excluded.contact_role, contact_email=excluded.contact_email, contact_phone=excluded.contact_phone, service_needs=excluded.service_needs, verification_status=excluded.verification_status, version=businesses.version+1, updated_at=excluded.updated_at`)
-            .bind(businessId, requestKey, registeredName, value(body, 'trading_name', 240), registrationNumber, registrationException, countryCode, value(body, 'industry', 160), value(body, 'contact_name', 160), value(body, 'contact_role', 160), contactEmail, value(body, 'contact_phone', 40), value(body, 'service_needs', 2_000), status, identity.id, timestamp, timestamp),
-          env.DB.prepare('insert into business_evidence (id, business_id, reference, notes) values (?, ?, ?, ?) on conflict(business_id) do update set reference=excluded.reference, notes=excluded.notes')
-            .bind(newId(), businessId, value(body, 'evidence_reference', 500), value(body, 'evidence_notes', 2_000)),
-        ];
-        if (existing) statements.push(env.DB.prepare('delete from business_sites where business_id = ?').bind(businessId));
-        for (const site of sites) {
-          const name = value(site, 'name', 160); const address = value(site, 'address', 400); const city = value(site, 'city', 160);
-          if (submit && (!name || !address || !city)) throw new InputError('Complete each collection site.');
-          statements.push(env.DB.prepare('insert into business_sites (id, business_id, name, address, city) values (?, ?, ?, ?, ?)').bind(newId(), businessId, name, address, city));
-        }
-        statements.push(env.DB.prepare('insert into audit_logs (table_name, record_id, action, actor_user_id, new_values, occurred_at) values (?, ?, ?, ?, ?, ?)').bind('businesses', businessId, existing ? 'update' : 'insert', identity.id, JSON.stringify({ verification_status: status }), timestamp));
-        await env.DB.batch(statements);
-        return json({ id: businessId, verification_status: status }, { status: existing ? 200 : 201, headers });
+            on conflict(created_by, request_key) do update set registered_name=excluded.registered_name, trading_name=excluded.trading_name, registration_number=excluded.registration_number, registration_exception=excluded.registration_exception, country_code=excluded.country_code, industry=excluded.industry, contact_name=excluded.contact_name, contact_role=excluded.contact_role, contact_email=excluded.contact_email, contact_phone=excluded.contact_phone, service_needs=excluded.service_needs, verification_status=excluded.verification_status, version=businesses.version+1, updated_at=excluded.updated_at
+            where businesses.verification_status = 'draft'`)
+            .bind(businessId, requestKey, input.registeredName, input.tradingName, input.registrationNumber, input.registrationException, input.countryCode, input.industry, input.contactName, input.contactRole, input.contactEmail, input.contactPhone, input.serviceNeeds, input.status, identity.id, timestamp, timestamp),
+          ...businessDetailStatements(env, businessId, input),
+          env.DB.prepare('insert into audit_logs (table_name, record_id, action, actor_user_id, new_values, occurred_at) values (?, ?, ?, ?, ?, ?)')
+            .bind('businesses', businessId, existing ? 'update' : 'insert', identity.id, JSON.stringify({ verification_status: input.status }), timestamp),
+        ]);
+        return json({ id: businessId, verification_status: input.status }, { status: existing ? 200 : 201, headers });
       } catch (error) {
         return failure(error, headers, businessConflicts);
+      }
+    }
+
+    const businessId = url.pathname.match(/^\/v1\/businesses\/([0-9a-f-]{36})$/i)?.[1];
+
+    if (businessId && request.method === 'GET') {
+      const identity = await principal(request, env);
+      if (identity instanceof Response) return identity;
+      if (!staff(identity)) return json({ error: 'staff_access_required' }, { status: 403, headers });
+      const business = await env.DB.prepare('select id, registered_name, trading_name, registration_number, registration_exception, country_code, industry, contact_name, contact_role, contact_email, contact_phone, service_needs, verification_status, service_status, version, updated_at from businesses where id = ?')
+        .bind(businessId).first<Record<string, unknown>>();
+      if (!business) return json({ error: 'not_found' }, { status: 404, headers });
+      const sites = await env.DB.prepare('select name, address, city from business_sites where business_id = ? order by rowid').bind(businessId).all();
+      const evidence = await env.DB.prepare('select reference, notes from business_evidence where business_id = ?').bind(businessId).first<{ notes: string; reference: string }>();
+      return json({ business: { ...business, evidence_notes: evidence?.notes ?? '', evidence_reference: evidence?.reference ?? '', sites: sites.results } }, { headers });
+    }
+
+    // Any staff member may finish a draft. Once submitted, a registration is locked.
+    if (businessId && request.method === 'PUT') {
+      const identity = await principal(request, env);
+      if (identity instanceof Response) return identity;
+      if (!staff(identity)) return json({ error: 'staff_access_required' }, { status: 403, headers });
+      try {
+        const body = await readBody(request);
+        const version = body.version;
+        if (typeof version !== 'number' || !Number.isInteger(version)) throw new InputError('version is required.');
+        const input = businessInput(body);
+        const current = await env.DB.prepare('select verification_status, version from businesses where id = ?').bind(businessId).first<{ verification_status: string; version: number }>();
+        if (!current) return json({ error: 'not_found' }, { status: 404, headers });
+        if (current.verification_status !== 'draft') return json({ error: lockedRegistration }, { status: 409, headers });
+        if (current.version !== version) return json({ error: staleDraft }, { status: 409, headers });
+        const timestamp = now();
+        await env.DB.batch([
+          // Guard against a concurrent save: audit_logs.occurred_at is NOT NULL, so if the draft was changed or
+          // submitted after the check above, the subquery yields NULL, this insert fails and D1 rolls back the batch.
+          env.DB.prepare("insert into audit_logs (table_name, record_id, action, actor_user_id, new_values, occurred_at) values ('businesses', ?, 'update', ?, ?, (select ? from businesses where id = ? and verification_status = 'draft' and version = ?))")
+            .bind(businessId, identity.id, JSON.stringify({ verification_status: input.status }), timestamp, businessId, version),
+          env.DB.prepare('update businesses set registered_name = ?, trading_name = ?, registration_number = ?, registration_exception = ?, country_code = ?, industry = ?, contact_name = ?, contact_role = ?, contact_email = ?, contact_phone = ?, service_needs = ?, verification_status = ?, version = version + 1, updated_at = ? where id = ?')
+            .bind(input.registeredName, input.tradingName, input.registrationNumber, input.registrationException, input.countryCode, input.industry, input.contactName, input.contactRole, input.contactEmail, input.contactPhone, input.serviceNeeds, input.status, timestamp, businessId),
+          ...businessDetailStatements(env, businessId, input),
+        ]);
+        return json({ id: businessId, verification_status: input.status, version: version + 1 }, { headers });
+      } catch (error) {
+        return failure(error, headers, { ...businessConflicts, 'audit_logs.occurred_at': staleDraft });
       }
     }
 

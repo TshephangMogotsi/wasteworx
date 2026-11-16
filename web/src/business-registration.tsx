@@ -1,5 +1,5 @@
-import { type FormEvent, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ChevronDown } from 'lucide-react';
 
 import { countries } from './countries';
@@ -21,12 +21,37 @@ const blankForm = (): Form => ({
 });
 const stages = ['Business', 'Contact', 'Sites', 'Evidence', 'Review'];
 
+type SavedBusiness = Omit<Form, 'registration_number'> & { registration_number: string | null; verification_status: string; version: number };
+const formFrom = (saved: SavedBusiness): Form => ({
+  contact_email: saved.contact_email, contact_name: saved.contact_name, contact_phone: saved.contact_phone, contact_role: saved.contact_role,
+  country_code: saved.country_code, evidence_notes: saved.evidence_notes, evidence_reference: saved.evidence_reference, industry: saved.industry,
+  registered_name: saved.registered_name, registration_exception: saved.registration_exception, registration_number: saved.registration_number ?? '',
+  service_needs: saved.service_needs, trading_name: saved.trading_name,
+  sites: saved.sites.length ? saved.sites.map(({ address, city, name }) => ({ address, city, name })) : [blankSite()],
+});
+
 function hasEmail(value: string) { return /^\S+@\S+\.\S+$/.test(value); }
 
 export function BusinessRegistration() {
   const [form, setForm] = useState<Form>(blankForm); const [step, setStep] = useState(0); const [siteIndex, setSiteIndex] = useState(0);
   const [noNumber, setNoNumber] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   const requestKey = useRef(`${Date.now()}-${Math.random().toString(36).slice(2)}`); const navigate = useNavigate();
+  // With an id in the route this form reopens a saved draft instead of starting a new registration.
+  const { id } = useParams(); const [version, setVersion] = useState(0); const [loading, setLoading] = useState(Boolean(id)); const [unavailable, setUnavailable] = useState<string | null>(null);
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { business } = await api<{ business: SavedBusiness }>(`/businesses/${id}`);
+        if (cancelled) return;
+        if (business.verification_status !== 'draft') return setUnavailable('This registration has been submitted and can no longer be edited.');
+        setForm(formFrom(business)); setVersion(business.version); setNoNumber(!business.registration_number && Boolean(business.registration_exception));
+      } catch (failure) { if (!cancelled) setUnavailable(failure instanceof Error ? failure.message : 'Unable to load the draft.'); }
+      finally { if (!cancelled) setLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [id]);
   const set = <K extends Exclude<keyof Form, 'sites'>>(key: K, value: Form[K]) => setForm((current) => ({ ...current, [key]: value }));
   const submitIssue = () => {
     if (!form.registered_name.trim() || !form.industry.trim() || (!form.registration_number.trim() && !form.registration_exception.trim())) return 'Enter the business identity details.';
@@ -39,12 +64,18 @@ export function BusinessRegistration() {
   async function save(submit: boolean) {
     if (submit) { const issue = submitIssue(); if (issue) return setError(issue); }
     setBusy(true); setError(null);
-    try { await api('/businesses', { method: 'POST', body: JSON.stringify({ ...form, submit, request_key: requestKey.current }) }); navigate('/admin/businesses'); }
+    try {
+      if (id) await api(`/businesses/${id}`, { method: 'PUT', body: JSON.stringify({ ...form, submit, version }) });
+      else await api('/businesses', { method: 'POST', body: JSON.stringify({ ...form, submit, request_key: requestKey.current }) });
+      navigate('/admin/businesses');
+    }
     catch (failure) { setError(failure instanceof Error ? failure.message : 'Unable to save the business.'); }
     finally { setBusy(false); }
   }
+  if (loading) return <main className="page"><p className="eyebrow">BUSINESS ONBOARDING</p><h1>Finish a draft</h1><p>Loading draft…</p></main>;
+  if (unavailable) return <main className="page"><p className="eyebrow">BUSINESS ONBOARDING</p><h1>Finish a draft</h1><p className="message">{unavailable}</p><Link className="muted-link" to="/admin/businesses">Back to businesses</Link></main>;
   const activeSite = form.sites[siteIndex];
-  return <main className="page"><p className="eyebrow">BUSINESS ONBOARDING</p><h1>Register a business</h1><div className="steps">{stages.map((label, index) => <button key={label} className={index === step ? 'active' : ''} disabled={index > step} onClick={() => setStep(index)}><span>{index + 1}</span>{label}</button>)}</div>
+  return <main className="page"><p className="eyebrow">BUSINESS ONBOARDING</p><h1>{id ? 'Finish a draft' : 'Register a business'}</h1><div className="steps">{stages.map((label, index) => <button key={label} className={index === step ? 'active' : ''} disabled={index > step} onClick={() => setStep(index)}><span>{index + 1}</span>{label}</button>)}</div>
     <section className="form-card">{error ? <p className="message">{error}</p> : null}
       {step === 0 ? <><h2>Business identity</h2><p>Start with the business name and registration details.</p><label>Registered business name<input value={form.registered_name} onChange={(event) => set('registered_name', event.target.value)} /></label><label>Trading name <small>(optional)</small><input value={form.trading_name} onChange={(event) => set('trading_name', event.target.value)} /></label><label className="check"><input type="checkbox" checked={noNumber} onChange={(event) => { setNoNumber(event.target.checked); set('registration_number', ''); set('registration_exception', ''); }} />No business number available</label>{noNumber ? <label>Why is no business number available?<textarea value={form.registration_exception} onChange={(event) => set('registration_exception', event.target.value)} /></label> : <label>Business registration number<input value={form.registration_number} onChange={(event) => set('registration_number', event.target.value)} /></label>}<div className="business-field-row"><div className="business-country"><label>Country</label><div className="country-select"><select value={form.country_code} onChange={(event) => set('country_code', event.target.value)}>{countries.map((country) => <option key={country.code} value={country.code}>{country.name} ({country.code})</option>)}</select><ChevronDown aria-hidden="true" className="select-chevron-icon" size={28} strokeWidth={3} /></div></div><div className="business-industry"><label>Industry</label><input value={form.industry} onChange={(event) => set('industry', event.target.value)} /></div></div></> : null}
       {step === 1 ? <><h2>Primary contact</h2><div className="contact-field-row"><div className="contact-major"><label>Name<input value={form.contact_name} onChange={(event) => set('contact_name', event.target.value)} /></label></div><div className="contact-minor"><label>Position <small>(optional)</small><input value={form.contact_role} onChange={(event) => set('contact_role', event.target.value)} /></label></div></div><div className="contact-field-row"><div className="contact-major"><label>Email<input type="email" value={form.contact_email} onChange={(event) => set('contact_email', event.target.value)} /></label></div><div className="contact-minor"><label>Phone number<input value={form.contact_phone} onChange={(event) => set('contact_phone', event.target.value)} /></label></div></div><label>Service needs <small>(optional)</small><textarea value={form.service_needs} onChange={(event) => set('service_needs', event.target.value)} placeholder="Materials, quantities and collection frequency" /></label></> : null}

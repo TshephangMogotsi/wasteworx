@@ -1,0 +1,7 @@
+# Copy to cloudflare/api/.dev.vars (git-ignored). Read by `npm run api:dev`.
+# Use the same project values as VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY in .env.local.
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_PUBLISHABLE_KEY=your-publishable-key
+
+# Optional. Without it, invitation emails are skipped and reported as "pending".
+# RESEND_API_KEY=
