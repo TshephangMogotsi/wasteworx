@@ -20,6 +20,7 @@
   "scripts": {
     "start": "vite --host 127.0.0.1",
     "web:dev": "vite --host 127.0.0.1",
+    "api:dev": "npx wrangler dev --config cloudflare/api/wrangler.jsonc",
     "web:build": "vite build",
     "web:typecheck": "tsc --project web/tsconfig.json",
     "web:preview": "vite preview --host 127.0.0.1",

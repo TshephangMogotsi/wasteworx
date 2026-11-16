@@ -207,5 +207,3 @@ export default {
     return secure(await env.ASSETS.fetch(request));
   },
 };
-import { authenticateSupabase } from './supabase-auth';
-

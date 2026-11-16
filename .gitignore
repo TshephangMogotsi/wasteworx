@@ -9,6 +9,11 @@ dist-web/
 # Vercel
 .vercel/
 
+# Cloudflare Worker local state and local secrets
+.wrangler/
+.dev.vars
+.dev.vars.*
+
 # debug
 npm-debug.*
 yarn-debug.*
