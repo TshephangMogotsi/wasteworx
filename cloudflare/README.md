@@ -29,6 +29,22 @@ npx wrangler d1 migrations apply wasteworx-development --local --config cloudfla
 npx wrangler dev --config cloudflare/api/wrangler.jsonc
 ```
 
+## Signup confirmation
+
+Deploy the web build with the `/confirm-email` page before testing new confirmation emails.
+
+In the hosted Supabase project's **Authentication → URL Configuration**, set **Site URL** to the intended public WasteWorx origin rather than localhost. Add these development Worker redirect URLs for regular signup, household invitations, and business invitations:
+
+- `https://wasteworx-api-development.zinjie7.workers.dev/confirm-email`
+- `https://wasteworx-api-development.zinjie7.workers.dev/confirm-email?invitation=household`
+- `https://wasteworx-api-development.zinjie7.workers.dev/confirm-email?invitation=business`
+
+Add the same paths for each other environment that uses the project, including local development if needed. Keep the other existing redirect entries for password resets and earlier invitation links.
+
+Under **Authentication → Email Templates → Confirm signup**, set the subject to **Confirm your WasteWorx email** and paste the [confirmation template](../supabase/templates/confirm-signup.html). The template uses Supabase's generated confirmation URL. A branded sender address requires custom SMTP in Supabase.
+
+Test with a fresh email after saving the settings. If an earlier link has expired or points to localhost, open `/confirm-email` on the deployed site and request a fresh link.
+
 ## Docker-free pilot-data import
 
 The importer reads the linked Supabase project through its Management API and writes only to the isolated Cloudflare development D1 database. It never writes to Supabase. It deliberately requires `--replace` because it clears the development target before importing.
